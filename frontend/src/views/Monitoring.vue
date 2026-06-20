@@ -6,6 +6,10 @@
         <p class="subtitle">实时监控鱼塘水质指标，确保水环境安全</p>
       </div>
       <div class="header-actions">
+        <div v-if="monitoringStore.hasAlert" class="alert-pill" :class="{ blink: isNewAlert }">
+          <span class="pulse-dot"></span>
+          <span>告警中 ({{ monitoringStore.abnormalMetrics.length }})</span>
+        </div>
         <div class="polling-control">
           <span class="polling-label">刷新频率:</span>
           <select v-model="pollInterval" @change="handleIntervalChange" class="interval-select">
@@ -21,9 +25,56 @@
           >
             {{ monitoringStore.isPolling ? '⏸ 暂停' : '▶ 开始' }}
           </button>
+          <button
+            class="btn sound-btn"
+            :class="{ active: soundEnabled }"
+            @click="toggleSound"
+            :title="soundEnabled ? '关闭告警声音' : '开启告警声音'"
+          >
+            {{ soundEnabled ? '🔔' : '🔕' }}
+          </button>
         </div>
       </div>
     </div>
+
+    <transition name="slide-down">
+      <div v-if="monitoringStore.hasAlert" class="alert-banner">
+        <div class="alert-left">
+          <div class="alert-icon">🚨</div>
+          <div class="alert-content">
+            <div class="alert-title">水质指标异常！请立即处理</div>
+            <div class="alert-metrics">
+              <div
+                v-for="metric in monitoringStore.abnormalMetrics"
+                :key="metric.key"
+                class="alert-metric-item"
+              >
+                <span class="metric-tag">{{ metric.name }}</span>
+                <span class="metric-direction">
+                  {{ metric.status === 'high' ? '↑ 偏高' : '↓ 偏低' }}
+                </span>
+                <span class="metric-current">
+                  当前: <strong>{{ Number(metric.value).toFixed(2) }} {{ metric.unit }}</strong>
+                </span>
+                <span class="metric-range">
+                  (安全范围: {{ metric.range.min }} ~ {{ metric.range.max }} {{ metric.unit }})
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="alert-right">
+          <div class="alert-time">{{ formatAlertTime(monitoringStore.latestData?.created_at) }}</div>
+          <button
+            v-if="Notification.permission !== 'granted'"
+            class="notify-btn"
+            @click="requestNotifyPermission"
+          >
+            🔔 开启桌面通知
+          </button>
+        </div>
+      </div>
+    </transition>
 
     <div v-if="monitoringStore.error" class="error-banner">
       <span>⚠️</span>
@@ -96,6 +147,34 @@
             <span class="detail-label">溶解氧</span>
             <span class="detail-value" :class="doStatus">
               {{ monitoringStore.latestData?.dissolved_oxygen?.toFixed(2) || '--' }} mg/L
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="monitoringStore.alerts.length > 0" class="alerts-history card">
+      <div class="history-header">
+        <h3>告警历史 (最近 {{ monitoringStore.alerts.length }} 条)</h3>
+        <button class="btn btn-secondary btn-small" @click="monitoringStore.clearAlerts()">
+          清空
+        </button>
+      </div>
+      <div class="history-list">
+        <div
+          v-for="alert in monitoringStore.alerts.slice(0, 10)"
+          :key="alert.id"
+          class="history-item"
+        >
+          <div class="history-time">{{ formatTime(alert.timestamp) }}</div>
+          <div class="history-metrics">
+            <span
+              v-for="m in alert.metrics"
+              :key="m.key"
+              class="history-tag"
+              :class="m.status"
+            >
+              {{ m.name }} {{ m.status === 'high' ? '↑' : '↓' }} {{ Number(m.value).toFixed(2) }}{{ m.unit }}
             </span>
           </div>
         </div>
@@ -185,7 +264,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useMonitoringStore } from '@/stores/monitoring'
 import { useThresholdsStore } from '@/stores/thresholds'
 import MetricCard from '@/components/MetricCard.vue'
@@ -194,10 +273,13 @@ import TrendChart from '@/components/TrendChart.vue'
 const monitoringStore = useMonitoringStore()
 const thresholdsStore = useThresholdsStore()
 const pollInterval = ref(3000)
+const soundEnabled = ref(true)
+const isNewAlert = ref(false)
+let audioCtx = null
+let blinkTimer = null
+let lastNotifiedAlertKey = ''
 
-const statusResult = computed(() => {
-  return thresholdsStore.checkAll(monitoringStore.latestData)
-})
+const statusResult = computed(() => monitoringStore.statusCheck)
 
 const tempStatus = computed(() => statusResult.value?.temperature?.status || 'unknown')
 const phStatus = computed(() => statusResult.value?.ph?.status || 'unknown')
@@ -240,6 +322,15 @@ const formatTime = (isoString) => {
   return `${y}-${m}-${d} ${h}:${min}:${s}`
 }
 
+const formatAlertTime = (isoString) => {
+  if (!isoString) return '--'
+  const date = new Date(isoString)
+  const h = String(date.getHours()).padStart(2, '0')
+  const min = String(date.getMinutes()).padStart(2, '0')
+  const s = String(date.getSeconds()).padStart(2, '0')
+  return `${h}:${min}:${s}`
+}
+
 const togglePolling = () => {
   if (monitoringStore.isPolling) {
     monitoringStore.stopPolling()
@@ -254,6 +345,64 @@ const handleIntervalChange = () => {
   }
 }
 
+const toggleSound = () => {
+  soundEnabled.value = !soundEnabled.value
+}
+
+const playAlertSound = () => {
+  if (!soundEnabled.value) return
+  try {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)()
+    }
+    const now = audioCtx.currentTime
+    for (let i = 0; i < 3; i++) {
+      const osc = audioCtx.createOscillator()
+      const gain = audioCtx.createGain()
+      osc.type = 'sine'
+      osc.frequency.setValueAtTime(880, now + i * 0.35)
+      osc.frequency.setValueAtTime(660, now + i * 0.35 + 0.15)
+      gain.gain.setValueAtTime(0.25, now + i * 0.35)
+      gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.35 + 0.3)
+      osc.connect(gain)
+      gain.connect(audioCtx.destination)
+      osc.start(now + i * 0.35)
+      osc.stop(now + i * 0.35 + 0.3)
+    }
+  } catch (e) {
+    console.warn('播放告警声音失败:', e)
+  }
+}
+
+const sendDesktopNotification = (metrics) => {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
+  const body = metrics.map(m =>
+    `${m.name} ${m.status === 'high' ? '偏高' : '偏低'}: ${Number(m.value).toFixed(2)}${m.unit} (范围 ${m.range.min}~${m.range.max}${m.unit})`
+  ).join('\n')
+  try {
+    new Notification('🚨 鱼塘水质告警', {
+      body,
+      icon: 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐟</text></svg>',
+      requireInteraction: true,
+      tag: 'fishpond-alert'
+    })
+  } catch (e) {
+    console.warn('桌面通知失败:', e)
+  }
+}
+
+const requestNotifyPermission = async () => {
+  if (typeof Notification === 'undefined') {
+    alert('当前浏览器不支持桌面通知')
+    return
+  }
+  if (Notification.permission === 'granted') return
+  const result = await Notification.requestPermission()
+  if (result === 'granted') {
+    new Notification('✅ 桌面通知已开启', { body: '出现水质异常时将第一时间通知您' })
+  }
+}
+
 const getRowStatus = (item) => {
   const checks = thresholdsStore.checkAll(item)
   if (!checks) return 'unknown'
@@ -265,14 +414,35 @@ const getRowStatusText = (item) => {
   return getRowStatus(item) === 'normal' ? '正常' : '异常'
 }
 
+watch(() => monitoringStore.abnormalMetrics, (newVal, oldVal) => {
+  if (newVal.length > 0) {
+    const newKey = newVal.map(m => `${m.key}:${m.status}`).sort().join('|')
+    if (newKey !== lastNotifiedAlertKey) {
+      lastNotifiedAlertKey = newKey
+      isNewAlert.value = true
+      playAlertSound()
+      sendDesktopNotification(newVal)
+      if (blinkTimer) clearTimeout(blinkTimer)
+      blinkTimer = setTimeout(() => { isNewAlert.value = false }, 3000)
+    }
+  } else {
+    lastNotifiedAlertKey = ''
+  }
+}, { deep: true })
+
 onMounted(async () => {
   await thresholdsStore.fetchLatest()
   await monitoringStore.fetchList(60)
   monitoringStore.startPolling(pollInterval.value)
+
+  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+    // 不打扰用户，等用户手动开启
+  }
 })
 
 onBeforeUnmount(() => {
   monitoringStore.stopPolling()
+  if (blinkTimer) clearTimeout(blinkTimer)
 })
 </script>
 
@@ -311,6 +481,41 @@ onBeforeUnmount(() => {
   gap: 16px;
 }
 
+.alert-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: #fff2f0;
+  border: 1px solid #ffccc7;
+  border-radius: 20px;
+  color: #ff4d4f;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.alert-pill.blink {
+  animation: pillBlink 0.5s ease-in-out 3;
+}
+
+@keyframes pillBlink {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.08); background: #ff4d4f; color: white; }
+}
+
+.pulse-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ff4d4f;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 0 0 rgba(255, 77, 79, 0.5); }
+  50% { opacity: 0.7; transform: scale(1.1); box-shadow: 0 0 0 8px rgba(255, 77, 79, 0); }
+}
+
 .polling-control {
   display: flex;
   align-items: center;
@@ -337,7 +542,7 @@ onBeforeUnmount(() => {
   border-color: #1890ff;
 }
 
-.polling-btn {
+.polling-btn, .sound-btn {
   padding: 8px 18px;
   border: none;
   border-radius: 8px;
@@ -365,6 +570,153 @@ onBeforeUnmount(() => {
 .btn-stop:hover {
   opacity: 0.9;
   transform: translateY(-1px);
+}
+
+.sound-btn {
+  background: #f5f5f5;
+  color: #666;
+  padding: 8px 14px;
+  font-size: 16px;
+}
+
+.sound-btn.active {
+  background: #e6f7ff;
+  color: #1890ff;
+}
+
+.slide-down-enter-active,
+.slide-down-leave-active {
+  transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  max-height: 300px;
+  overflow: hidden;
+}
+
+.slide-down-enter-from,
+.slide-down-leave-to {
+  opacity: 0;
+  max-height: 0;
+  transform: translateY(-20px);
+}
+
+.alert-banner {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 20px;
+  background: linear-gradient(135deg, #ff4d4f 0%, #ff7875 100%);
+  padding: 20px 24px;
+  border-radius: 16px;
+  color: white;
+  box-shadow: 0 8px 24px rgba(255, 77, 79, 0.25);
+  animation: bannerShake 0.5s ease-in-out;
+}
+
+@keyframes bannerShake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-6px); }
+  40% { transform: translateX(6px); }
+  60% { transform: translateX(-4px); }
+  80% { transform: translateX(4px); }
+}
+
+.alert-left {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  flex: 1;
+}
+
+.alert-icon {
+  font-size: 48px;
+  animation: iconShake 0.6s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+@keyframes iconShake {
+  0%, 100% { transform: rotate(0deg); }
+  25% { transform: rotate(-12deg); }
+  75% { transform: rotate(12deg); }
+}
+
+.alert-content {
+  flex: 1;
+}
+
+.alert-title {
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 10px;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
+.alert-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.alert-metric-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 14px;
+  background: rgba(255, 255, 255, 0.15);
+  padding: 8px 14px;
+  border-radius: 10px;
+  backdrop-filter: blur(4px);
+}
+
+.metric-tag {
+  background: rgba(255, 255, 255, 0.25);
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-weight: 600;
+}
+
+.metric-direction {
+  font-weight: 700;
+  font-size: 15px;
+}
+
+.metric-current strong {
+  font-size: 16px;
+}
+
+.metric-range {
+  opacity: 0.9;
+  font-size: 12px;
+}
+
+.alert-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-shrink: 0;
+}
+
+.alert-time {
+  font-size: 13px;
+  opacity: 0.9;
+  font-family: 'SF Mono', Monaco, monospace;
+}
+
+.notify-btn {
+  background: rgba(255, 255, 255, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  color: white;
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.3s;
+  font-weight: 500;
+}
+
+.notify-btn:hover {
+  background: white;
+  color: #ff4d4f;
 }
 
 .error-banner {
@@ -498,6 +850,89 @@ onBeforeUnmount(() => {
   color: #ff4d4f;
 }
 
+.alerts-history {
+  padding: 20px 24px;
+}
+
+.history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.history-header h3 {
+  font-size: 18px;
+  font-weight: 600;
+  color: #333;
+}
+
+.btn-small {
+  padding: 6px 14px;
+  font-size: 13px;
+  border: 1px solid #d9d9d9;
+  background: white;
+  color: #666;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.3s;
+}
+
+.btn-small:hover {
+  border-color: #ff4d4f;
+  color: #ff4d4f;
+}
+
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+  background: #fffbfb;
+  border-left: 3px solid #ff4d4f;
+  border-radius: 8px;
+}
+
+.history-time {
+  font-size: 12px;
+  color: #999;
+  font-family: 'SF Mono', Monaco, monospace;
+  flex-shrink: 0;
+}
+
+.history-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.history-tag {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: 'SF Mono', Monaco, monospace;
+}
+
+.history-tag.high {
+  background: #fff2f0;
+  color: #ff4d4f;
+}
+
+.history-tag.low {
+  background: #fff7e6;
+  color: #fa8c16;
+}
+
 .section-title {
   font-size: 18px;
   font-weight: 600;
@@ -600,6 +1035,18 @@ td.high {
     flex-direction: column;
     gap: 16px;
     align-items: flex-start;
+  }
+
+  .alert-banner {
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .alert-right {
+    align-items: flex-start;
+    flex-direction: row;
+    justify-content: space-between;
+    width: 100%;
   }
 }
 </style>

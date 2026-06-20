@@ -16,7 +16,7 @@ async def create_monitoring_data(data: MonitoringDataCreate):
 
 @router.get("/latest", response_model=MonitoringDataResponse, summary="获取最新一条监测数据")
 async def get_latest_monitoring_data():
-    obj = await MonitoringData.first().order_by("-created_at")
+    obj = await MonitoringData.all().order_by("-created_at").first()
     if not obj:
         raise HTTPException(status_code=404, detail="暂无监测数据")
     return obj
@@ -24,7 +24,7 @@ async def get_latest_monitoring_data():
 
 @router.get("/", response_model=List[MonitoringDataResponse], summary="获取监测数据列表")
 async def list_monitoring_data(limit: int = 100, offset: int = 0):
-    data = await MonitoringData.all().limit(limit).offset(offset)
+    data = await MonitoringData.all().order_by("-created_at").limit(limit).offset(offset)
     return data
 
 

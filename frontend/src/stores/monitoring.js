@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, watch, getCurrentInstance } from 'vue'
 import { monitoringApi } from '@/api'
+import { useThresholdsStore } from '@/stores/thresholds'
 
 export const useMonitoringStore = defineStore('monitoring', () => {
   const latestData = ref(null)
@@ -9,15 +10,99 @@ export const useMonitoringStore = defineStore('monitoring', () => {
   const error = ref(null)
   const pollInterval = ref(null)
   const isPolling = ref(false)
+  const pollCount = ref(0)
+
+  const alerts = ref([])
+  const lastAlertKey = ref('')
+
+  function getThresholds() {
+    return useThresholdsStore()
+  }
+
+  const statusCheck = computed(() => {
+    if (!latestData.value) return null
+    return getThresholds().checkAll(latestData.value)
+  })
 
   const isDataNormal = computed(() => {
-    if (!latestData.value) return null
+    if (!statusCheck.value) return null
     return {
-      temperature: true,
-      ph: true,
-      dissolvedOxygen: true
+      temperature: statusCheck.value.temperature.isNormal,
+      ph: statusCheck.value.ph.isNormal,
+      dissolvedOxygen: statusCheck.value.dissolvedOxygen.isNormal
     }
   })
+
+  const hasAlert = computed(() => {
+    if (!statusCheck.value) return false
+    return Object.values(statusCheck.value).some(s => !s.isNormal)
+  })
+
+  const abnormalMetrics = computed(() => {
+    if (!statusCheck.value) return []
+    const thresholds = getThresholds()
+    const result = []
+    const metricNames = {
+      temperature: '水温',
+      ph: 'pH 值',
+      dissolvedOxygen: '溶解氧'
+    }
+    const units = {
+      temperature: '°C',
+      ph: '',
+      dissolvedOxygen: 'mg/L'
+    }
+    const valueKeys = {
+      temperature: 'temperature',
+      ph: 'ph',
+      dissolvedOxygen: 'dissolved_oxygen'
+    }
+    const rangeKeys = {
+      temperature: 'tempRange',
+      ph: 'phRange',
+      dissolvedOxygen: 'doRange'
+    }
+    for (const [key, check] of Object.entries(statusCheck.value)) {
+      if (!check.isNormal) {
+        result.push({
+          key,
+          name: metricNames[key],
+          value: latestData.value[valueKeys[key]],
+          unit: units[key],
+          status: check.status,
+          range: thresholds[rangeKeys[key]]
+        })
+      }
+    }
+    return result
+  })
+
+  function pushAlert(metrics) {
+    const key = metrics.map(m => `${m.key}:${m.status}:${m.value}`).join('|')
+    if (key === lastAlertKey.value) return
+    lastAlertKey.value = key
+
+    const alert = {
+      id: Date.now(),
+      timestamp: new Date().toISOString(),
+      metrics
+    }
+    alerts.value.unshift(alert)
+    if (alerts.value.length > 50) {
+      alerts.value.pop()
+    }
+  }
+
+  function clearAlerts() {
+    alerts.value = []
+    lastAlertKey.value = ''
+  }
+
+  watch(abnormalMetrics, (newVal, oldVal) => {
+    if (newVal.length > 0 && JSON.stringify(newVal) !== JSON.stringify(oldVal)) {
+      pushAlert(newVal)
+    }
+  }, { deep: true })
 
   async function fetchLatest() {
     isLoading.value = true
@@ -30,6 +115,10 @@ export const useMonitoringStore = defineStore('monitoring', () => {
         if (dataList.value.length > 60) {
           dataList.value.pop()
         }
+      }
+      pollCount.value++
+      if (pollCount.value % 10 === 0) {
+        getThresholds().fetchLatest().catch(() => {})
       }
     } catch (e) {
       error.value = e.response?.data?.detail || '获取数据失败'
@@ -95,6 +184,9 @@ export const useMonitoringStore = defineStore('monitoring', () => {
     latestData.value = null
     dataList.value = []
     error.value = null
+    alerts.value = []
+    lastAlertKey.value = ''
+    pollCount.value = 0
   }
 
   return {
@@ -103,13 +195,18 @@ export const useMonitoringStore = defineStore('monitoring', () => {
     isLoading,
     error,
     isPolling,
+    alerts,
+    statusCheck,
     isDataNormal,
+    hasAlert,
+    abnormalMetrics,
     fetchLatest,
     fetchList,
     createData,
     startPolling,
     stopPolling,
     updatePollingInterval,
+    clearAlerts,
     reset
   }
 })

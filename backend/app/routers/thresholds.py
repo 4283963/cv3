@@ -15,7 +15,7 @@ async def create_threshold_settings(data: ThresholdSettingsCreate):
 
 @router.get("/latest", response_model=ThresholdSettingsResponse, summary="获取最新阈值设置")
 async def get_latest_threshold_settings():
-    obj = await ThresholdSettings.first().order_by("-updated_at")
+    obj = await ThresholdSettings.all().order_by("-updated_at").first()
     if not obj:
         default_data = ThresholdSettingsCreate()
         obj = await ThresholdSettings.create(**default_data.model_dump())
