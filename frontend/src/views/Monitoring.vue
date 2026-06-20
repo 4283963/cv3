@@ -27,11 +27,11 @@
           </button>
           <button
             class="btn sound-btn"
-            :class="{ active: soundEnabled }"
-            @click="toggleSound"
-            :title="soundEnabled ? '关闭告警声音' : '开启告警声音'"
+            :class="{ active: alertStore.soundEnabled }"
+            @click="alertStore.toggleSound()"
+            :title="alertStore.soundEnabled ? '关闭告警声音' : '开启告警声音'"
           >
-            {{ soundEnabled ? '🔔' : '🔕' }}
+            {{ alertStore.soundEnabled ? '🔔' : '🔕' }}
           </button>
         </div>
       </div>
@@ -153,28 +153,30 @@
       </div>
     </div>
 
-    <div v-if="monitoringStore.alerts.length > 0" class="alerts-history card">
+    <div v-if="alertStore.history.length > 0" class="alerts-history card">
       <div class="history-header">
-        <h3>告警历史 (最近 {{ monitoringStore.alerts.length }} 条)</h3>
-        <button class="btn btn-secondary btn-small" @click="monitoringStore.clearAlerts()">
+        <h3>告警历史 (最近 {{ alertStore.history.length }} 条)</h3>
+        <button class="btn btn-secondary btn-small" @click="alertStore.clearHistory()">
           清空
         </button>
       </div>
       <div class="history-list">
         <div
-          v-for="alert in monitoringStore.alerts.slice(0, 10)"
-          :key="alert.id"
+          v-for="alert in alertStore.history.slice(0, 10)"
+          :key="alert.alert_id"
           class="history-item"
         >
-          <div class="history-time">{{ formatTime(alert.timestamp) }}</div>
+          <div class="history-time">
+            {{ formatTime(alert.timestamp) }} · {{ alert.pond_name }}
+          </div>
           <div class="history-metrics">
             <span
-              v-for="m in alert.metrics"
-              :key="m.key"
+              v-for="m in alert.abnormals"
+              :key="m.metric"
               class="history-tag"
               :class="m.status"
             >
-              {{ m.name }} {{ m.status === 'high' ? '↑' : '↓' }} {{ Number(m.value).toFixed(2) }}{{ m.unit }}
+              {{ m.metric_name }} {{ m.status === 'high' ? '↑' : '↓' }} {{ Number(m.value).toFixed(2) }}{{ m.unit }}
             </span>
           </div>
         </div>
@@ -264,20 +266,19 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useMonitoringStore } from '@/stores/monitoring'
 import { useThresholdsStore } from '@/stores/thresholds'
+import { useAlertStore } from '@/stores/alert'
 import MetricCard from '@/components/MetricCard.vue'
 import TrendChart from '@/components/TrendChart.vue'
 
 const monitoringStore = useMonitoringStore()
 const thresholdsStore = useThresholdsStore()
+const alertStore = useAlertStore()
 const pollInterval = ref(3000)
-const soundEnabled = ref(true)
 const isNewAlert = ref(false)
-let audioCtx = null
 let blinkTimer = null
-let lastNotifiedAlertKey = ''
 
 const statusResult = computed(() => monitoringStore.statusCheck)
 
@@ -345,62 +346,8 @@ const handleIntervalChange = () => {
   }
 }
 
-const toggleSound = () => {
-  soundEnabled.value = !soundEnabled.value
-}
-
-const playAlertSound = () => {
-  if (!soundEnabled.value) return
-  try {
-    if (!audioCtx) {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)()
-    }
-    const now = audioCtx.currentTime
-    for (let i = 0; i < 3; i++) {
-      const osc = audioCtx.createOscillator()
-      const gain = audioCtx.createGain()
-      osc.type = 'sine'
-      osc.frequency.setValueAtTime(880, now + i * 0.35)
-      osc.frequency.setValueAtTime(660, now + i * 0.35 + 0.15)
-      gain.gain.setValueAtTime(0.25, now + i * 0.35)
-      gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.35 + 0.3)
-      osc.connect(gain)
-      gain.connect(audioCtx.destination)
-      osc.start(now + i * 0.35)
-      osc.stop(now + i * 0.35 + 0.3)
-    }
-  } catch (e) {
-    console.warn('播放告警声音失败:', e)
-  }
-}
-
-const sendDesktopNotification = (metrics) => {
-  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
-  const body = metrics.map(m =>
-    `${m.name} ${m.status === 'high' ? '偏高' : '偏低'}: ${Number(m.value).toFixed(2)}${m.unit} (范围 ${m.range.min}~${m.range.max}${m.unit})`
-  ).join('\n')
-  try {
-    new Notification('🚨 鱼塘水质告警', {
-      body,
-      icon: 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐟</text></svg>',
-      requireInteraction: true,
-      tag: 'fishpond-alert'
-    })
-  } catch (e) {
-    console.warn('桌面通知失败:', e)
-  }
-}
-
-const requestNotifyPermission = async () => {
-  if (typeof Notification === 'undefined') {
-    alert('当前浏览器不支持桌面通知')
-    return
-  }
-  if (Notification.permission === 'granted') return
-  const result = await Notification.requestPermission()
-  if (result === 'granted') {
-    new Notification('✅ 桌面通知已开启', { body: '出现水质异常时将第一时间通知您' })
-  }
+const requestNotifyPermission = () => {
+  alertStore.requestNotifyPermission()
 }
 
 const getRowStatus = (item) => {
@@ -414,30 +361,23 @@ const getRowStatusText = (item) => {
   return getRowStatus(item) === 'normal' ? '正常' : '异常'
 }
 
-watch(() => monitoringStore.abnormalMetrics, (newVal, oldVal) => {
-  if (newVal.length > 0) {
-    const newKey = newVal.map(m => `${m.key}:${m.status}`).sort().join('|')
-    if (newKey !== lastNotifiedAlertKey) {
-      lastNotifiedAlertKey = newKey
-      isNewAlert.value = true
-      playAlertSound()
-      sendDesktopNotification(newVal)
-      if (blinkTimer) clearTimeout(blinkTimer)
-      blinkTimer = setTimeout(() => { isNewAlert.value = false }, 3000)
-    }
-  } else {
-    lastNotifiedAlertKey = ''
+let lastLocalAlertKey = ''
+watch([tempStatus, phStatus, doStatus], () => {
+  const key = [tempStatus.value, phStatus.value, doStatus.value].join('|')
+  if (overallStatusClass.value === 'status-alert' && key !== lastLocalAlertKey) {
+    lastLocalAlertKey = key
+    isNewAlert.value = true
+    if (blinkTimer) clearTimeout(blinkTimer)
+    blinkTimer = setTimeout(() => { isNewAlert.value = false }, 3000)
+  } else if (overallStatusClass.value !== 'status-alert') {
+    lastLocalAlertKey = ''
   }
-}, { deep: true })
+})
 
 onMounted(async () => {
   await thresholdsStore.fetchLatest()
   await monitoringStore.fetchList(60)
   monitoringStore.startPolling(pollInterval.value)
-
-  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
-    // 不打扰用户，等用户手动开启
-  }
 })
 
 onBeforeUnmount(() => {

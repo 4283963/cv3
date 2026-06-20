@@ -1,8 +1,13 @@
 from fastapi import APIRouter, HTTPException
 from tortoise.exceptions import DoesNotExist
+from typing import Optional
 
 from app.models import ThresholdSettings
-from app.schemas import ThresholdSettingsCreate, ThresholdSettingsResponse, StatusResponse
+from app.schemas import (
+    ThresholdSettingsCreate,
+    ThresholdSettingsResponse,
+    StatusResponse,
+)
 
 router = APIRouter(prefix="/api/thresholds", tags=["阈值设置"])
 
@@ -14,8 +19,13 @@ async def create_threshold_settings(data: ThresholdSettingsCreate):
 
 
 @router.get("/latest", response_model=ThresholdSettingsResponse, summary="获取最新阈值设置")
-async def get_latest_threshold_settings():
-    obj = await ThresholdSettings.all().order_by("-updated_at").first()
+async def get_latest_threshold_settings(pond_id: Optional[int] = None):
+    qs = ThresholdSettings.all()
+    if pond_id is not None:
+        qs = qs.filter(pond_id=pond_id)
+    obj = await qs.order_by("-updated_at").first()
+    if not obj and pond_id is not None:
+        obj = await ThresholdSettings.all().filter(pond_id=None).order_by("-updated_at").first()
     if not obj:
         default_data = ThresholdSettingsCreate()
         obj = await ThresholdSettings.create(**default_data.model_dump())

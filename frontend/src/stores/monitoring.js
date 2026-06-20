@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref, computed, watch, getCurrentInstance } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { monitoringApi } from '@/api'
 import { useThresholdsStore } from '@/stores/thresholds'
 
